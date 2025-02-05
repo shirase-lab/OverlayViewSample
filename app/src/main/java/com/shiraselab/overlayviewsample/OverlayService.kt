@@ -1,7 +1,6 @@
 package com.shiraselab.overlayviewsample
 
 import android.annotation.SuppressLint
-import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -9,13 +8,17 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.Point
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
+import android.view.GestureDetector
 import android.view.LayoutInflater
 import android.view.MotionEvent
 import android.view.View
@@ -34,30 +37,52 @@ import androidx.work.WorkInfo
 import java.util.concurrent.TimeUnit
 
 class OverlayService : Service() {
+    val TAG: String = this::class.java.simpleName
     companion object {
-        val TAG: String = this::class.java.simpleName
         const val ONGOING_NOTIFICATION_ID = 1
-        const val CHANNEL_ID = "ServiceBasicStudy"
-        const val CHANNEL_NAME = "ServiceBasicStudy"
+        const val CHANNEL_ID = "OverlayViewService"
+        const val CHANNEL_NAME = "OverlayViewService"
     }
 
-    private var startMode = START_NOT_STICKY    // indicates how to behave if the service is killed
-    private var binder = MyBinder()             // interface for clients that bind
+    inner class OverlayServiceBinder : Binder() {
+        fun getService(): OverlayService = this@OverlayService
+    }
+    private var binder = OverlayServiceBinder()             // interface for clients that bind
     private var allowRebind = true              // indicates whether onRebind should be used
 
-    private val isUiThread = isUiThread()
+    private val isUiThread = Thread.currentThread() == Looper.getMainLooper().thread
 
     private lateinit var windowManager: WindowManager
     private val overlayView: LinearLayout by lazy { LayoutInflater.from(this).inflate(R.layout.overlay_layout, null) as LinearLayout }
     private lateinit var params: WindowManager.LayoutParams
+    private lateinit var gestureDetector: GestureDetector
+    private val channelId by lazy {
+        createNotificationChannel(this)
+    }
 
     @SuppressLint("ScheduleExactAlarm")
     override fun onCreate() {
         // The service is being created
         Log.d(TAG, "onCreate")
-
+        if (!Settings.canDrawOverlays(this)) {
+            Log.e(TAG, "オーバーレイ権限がないため、ウィンドウを追加できません")
+            stopSelf()
+            return
+        }
         // WindowManager を取得
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+
+        gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                // ダブルタップ時の処理
+                overlayView.setBackgroundColor(Color.RED) // 背景を赤に変更（例）
+                stopForeground(true) // 通知を削除
+                stopSelf()
+                val intent = Intent(applicationContext, OverlayService::class.java)
+                applicationContext.stopService(intent) // 確実にサービスを終了
+                return true
+            }
+        })
 
         // LinearLayout をインフレート
         overlayView.apply(clickListener())
@@ -70,42 +95,23 @@ class OverlayService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             android.graphics.PixelFormat.TRANSLUCENT
         )
-        val restartServiceIntent = Intent(applicationContext, OverlayService::class.java)
-        val restartServicePendingIntent = PendingIntent.getService(
-            applicationContext,
-            1,
-            restartServiceIntent,
-            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE // FLAG_ONE_SHOT を使用して新しいインテントで上書き
-        )
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        alarmManager.setExact(
-            AlarmManager.RTC_WAKEUP,
-            System.currentTimeMillis() + 1000, // 1秒後にサービス再起動
-            restartServicePendingIntent
-        )
 // WorkRequest を作成
         // オーバーレイビューを画面に追加
         windowManager.addView(overlayView, params)
     }
 
-    private val channelId by lazy {
-        createNotificationChannel(this, CHANNEL_ID, CHANNEL_NAME)
-    }
-
     private fun createNotificationChannel(
-        context: Context,
-        channelId: String,
-        channelName: String
+        context: Context
     ): String {
         val channel = NotificationChannel(
-            channelId,
-            channelName, NotificationManager.IMPORTANCE_NONE
+            CHANNEL_ID,
+            CHANNEL_NAME, NotificationManager.IMPORTANCE_NONE
         )
         channel.lightColor = Color.BLUE
         channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         val service = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         service.createNotificationChannel(channel)
-        return channelId
+        return CHANNEL_ID
     }
 
     @SuppressLint("ForegroundServiceType")
@@ -113,13 +119,20 @@ class OverlayService : Service() {
         // The service is starting, due to a call to startService()
         Log.d(TAG, "onStartCommand")
         Toast.makeText(applicationContext, "onStartCommand", Toast.LENGTH_SHORT).show()
-
         val notification = buildNotification(this, channelId)
-        startForeground(ONGOING_NOTIFICATION_ID, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                1,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC // 必要なサービスタイプを指定
+            )
+        } else {
+            startForeground(ONGOING_NOTIFICATION_ID, notification)
+        }
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent): IBinder? {
+    override fun onBind(intent: Intent): IBinder {
         // A client is binding to the service with bindService()
         Log.d(TAG, "onBind")
         Toast.makeText(applicationContext, "onBind", Toast.LENGTH_SHORT).show()
@@ -144,22 +157,14 @@ class OverlayService : Service() {
     override fun onDestroy() {
         // The service is no longer used and is being destroyed
         Log.d(TAG, "onDestroy")
+        // オーバーレイビューが追加されている場合のみ削除
+        windowManager.removeView(overlayView)
         Toast.makeText(applicationContext, "onDestroy", Toast.LENGTH_SHORT).show()
-    }
-
-    inner class MyBinder : Binder() {
-        fun getService(): OverlayService = this@OverlayService
-    }
-
-
-    fun awesomeMethod(msg: String) {
-        Log.d(TAG, "awesomeMethod")
-
-        Toast.makeText(
-            applicationContext,
-            "isUiThread $isUiThread / $msg",
-            Toast.LENGTH_SHORT
-        ).show()
+        // アプリを完全終了
+        val intent = Intent(this, MainActivity::class.java)
+        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+        intent.putExtra("EXIT", true)
+        startActivity(intent)
     }
 
     @SuppressLint("ScheduleExactAlarm")
@@ -167,27 +172,19 @@ class OverlayService : Service() {
         super.onTaskRemoved(rootIntent)
         Log.d(TAG, "onTaskRemoved")
         Toast.makeText(applicationContext, "onTaskRemoved", Toast.LENGTH_SHORT).show()
-
-        // サービスを再起動するための処理
-        val restartServiceIntent = Intent(applicationContext, OverlayService::class.java)
-        val restartServicePendingIntent = PendingIntent.getService(applicationContext, 1, restartServiceIntent, PendingIntent.FLAG_UPDATE_CURRENT)
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        alarmManager.setExact(AlarmManager.RTC_WAKEUP, System.currentTimeMillis() + 1000, restartServicePendingIntent)  // 1秒後にサービス再起動
     }
+
     private fun buildNotification(context: Context, channelId: String): Notification {
         val intent = Intent(context, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(context, channelId)
-            .setContentTitle("Service Basic Study")
+            .setContentTitle("OverlayViewService")
             .setContentText("Application is active.")
             .setContentIntent(pendingIntent)
             .setTicker("Application is active")
             .build()
     }
 
-    private fun isUiThread(): Boolean {
-        return Thread.currentThread() == Looper.getMainLooper().thread
-    }
     val displaySize: Point by lazy {
         val display = windowManager.defaultDisplay
         val size = Point()
@@ -206,6 +203,7 @@ class OverlayService : Service() {
                 false
             }.apply {
                 setOnTouchListener { view, motionEvent ->
+                    gestureDetector.onTouchEvent(motionEvent)
                     // タップした位置を取得する
                     val x = motionEvent.rawX.toInt()
                     val y = motionEvent.rawY.toInt()
